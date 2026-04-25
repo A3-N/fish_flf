@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -46,21 +47,19 @@ const configDir = "~/.config/fish"
 // ansiRegex strips escape sequences for search matching only — display is untouched
 var ansiRegex = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]`)
 
-// promptDelimiter is the detected prompt character (loaded from config, or fallback).
-var promptDelimiter = "►"
-
 // promptDelimiters is a list of common shell prompt characters, tried in order.
 // The configured delimiter is prepended at startup.
 var promptDelimiters = []string{"►", "❯", "❱", "➜", "λ", "$", "#", "%", ">"}
 
 // CommandBlock is a single command + its output from a log file.
 type CommandBlock struct {
-	File       string
-	LineNum    int
-	Command    string // ANSI-stripped command text (for filtering)
-	RawCommand string // original ANSI-colored command (for display)
-	StartByte  int64  // start offset in file
-	EndByte    int64  // end offset in file
+	File        string
+	LineNum     int
+	Command     string // ANSI-stripped command text (for filtering)
+	RawCommand  string // original ANSI-colored command (for display)
+	StartByte   int64  // start offset in file
+	EndByte     int64  // end offset in file
+	MatchedLine string // matched output line (if any)
 }
 
 // ---------------------------------------------------------------------------
@@ -70,10 +69,18 @@ type CommandBlock struct {
 func main() {
 	loadPromptConfig()
 
-	if len(os.Args) < 2 {
-		runInteractive()
+	searchOutput := false
+	args := os.Args[1:]
+
+	if len(args) > 0 && (args[0] == "-o" || args[0] == "--output") {
+		searchOutput = true
+		args = args[1:]
+	}
+
+	if len(args) == 0 {
+		runInteractive(searchOutput)
 	} else {
-		runSearch(strings.Join(os.Args[1:], " "))
+		runSearch(strings.Join(args, " "))
 	}
 }
 
@@ -89,7 +96,6 @@ func loadPromptConfig() {
 	if d == "" {
 		return
 	}
-	promptDelimiter = d
 	// Prepend configured delimiter so it's tried first
 	promptDelimiters = append([]string{d}, promptDelimiters...)
 }
@@ -274,13 +280,17 @@ func readBlockLines(b CommandBlock) []string {
 		return nil
 	}
 	defer f.Close()
-	f.Seek(b.StartByte, 0)
+	if _, err := f.Seek(b.StartByte, 0); err != nil {
+		return nil
+	}
 	size := b.EndByte - b.StartByte
 	if size <= 0 {
 		return nil
 	}
 	buf := make([]byte, size)
-	io.ReadFull(f, buf)
+	if _, err := io.ReadFull(f, buf); err != nil {
+		return nil
+	}
 	return strings.Split(strings.TrimRight(string(buf), "\r\n"), "\n")
 }
 
@@ -347,6 +357,11 @@ func runSearch(query string) {
 // interactive TUI mode  (flf  — no args)
 // ---------------------------------------------------------------------------
 
+var (
+	fileBytes      map[string][]byte
+	fileBytesLower map[string][]byte
+)
+
 func getAllBlocks() []CommandBlock {
 	files := collectLogFiles()
 	results := make([][]CommandBlock, len(files))
@@ -368,15 +383,46 @@ func getAllBlocks() []CommandBlock {
 	return all
 }
 
-func filterBlocks(blocks []CommandBlock, query string) []CommandBlock {
+func filterBlocks(blocks []CommandBlock, query string, searchOutput bool) []CommandBlock {
 	if query == "" {
+		for i := range blocks {
+			blocks[i].MatchedLine = ""
+		}
 		return blocks
 	}
-	q := strings.ToLower(query)
+	qLower := strings.ToLower(query)
+	qBytes := []byte(qLower)
 	var out []CommandBlock
+
 	for _, b := range blocks {
-		if strings.Contains(strings.ToLower(b.Command), q) {
+		b.MatchedLine = ""
+		if strings.Contains(strings.ToLower(b.Command), qLower) {
 			out = append(out, b)
+			continue
+		}
+
+		if searchOutput {
+			lowerData := fileBytesLower[b.File]
+			if lowerData != nil && b.StartByte < int64(len(lowerData)) && b.EndByte <= int64(len(lowerData)) {
+				chunkLower := lowerData[b.StartByte:b.EndByte]
+				idx := bytes.Index(chunkLower, qBytes)
+				if idx != -1 {
+					chunk := fileBytes[b.File][b.StartByte:b.EndByte]
+					// Find start of line
+					start := idx
+					for start > 0 && chunk[start-1] != '\n' {
+						start--
+					}
+					// Find end of line
+					end := idx
+					for end < len(chunk) && chunk[end] != '\n' && chunk[end] != '\r' {
+						end++
+					}
+					lineStr := string(chunk[start:end])
+					b.MatchedLine = strings.TrimSpace(stripANSI(lineStr))
+					out = append(out, b)
+				}
+			}
 		}
 	}
 	return out
@@ -432,10 +478,7 @@ func readKey() string {
 	return ""
 }
 
-// moveTo positions the cursor (1-indexed row, col).
-func moveTo(row, col int) {
-	fmt.Printf("\033[%d;%dH", row, col)
-}
+
 
 // truncate a plain string to fit a given width.
 func truncStr(s string, maxW int) string {
@@ -476,12 +519,17 @@ func truncANSI(s string, maxW int) string {
 		return s + cReset
 	}
 
+	showW := maxW - 1
+	if showW < 1 {
+		showW = 1
+	}
+
 	var out strings.Builder
 	vis := 0
 	runes := []rune(s)
 	i := 0
 
-	for i < len(runes) && vis < maxW {
+	for i < len(runes) && vis < showW {
 		if runes[i] == '\x1b' {
 			// Copy the entire escape sequence without counting width
 			j := i + 1
@@ -520,15 +568,37 @@ func truncANSI(s string, maxW int) string {
 		i++
 	}
 
-	if vis >= maxW && i < len(runes) {
-		out.WriteString("…")
-	}
+	out.WriteString("…")
 	out.WriteString(cReset)
 	return out.String()
 }
 
-func runInteractive() {
+func runInteractive(searchOutput bool) {
 	blocks := getAllBlocks()
+
+	if searchOutput {
+		fileBytes = make(map[string][]byte)
+		fileBytesLower = make(map[string][]byte)
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		files := collectLogFiles()
+		for _, f := range files {
+			wg.Add(1)
+			go func(path string) {
+				defer wg.Done()
+				data, err := os.ReadFile(path)
+				if err == nil {
+					lower := bytes.ToLower(data)
+					mu.Lock()
+					fileBytes[path] = data
+					fileBytesLower[path] = lower
+					mu.Unlock()
+				}
+			}(f)
+		}
+		wg.Wait()
+	}
+
 	if len(blocks) == 0 {
 		fmt.Fprintf(os.Stderr, "%s%s  No commands found in log files.%s\n", cBold, cRed, cReset)
 		os.Exit(1)
@@ -560,7 +630,7 @@ func runInteractive() {
 	restore := func() {
 		if !restored {
 			fmt.Print(escShowCursor)
-			term.Restore(fd, oldState)
+			_ = term.Restore(fd, oldState)
 			restored = true
 		}
 	}
@@ -594,15 +664,7 @@ func runInteractive() {
 		}
 		w-- // Prevent wrapping when printing exactly on the right edge
 
-		maxVis := 16 // Dynamic dropdown size
-		if h < 15 {
-			maxVis = h - 5
-		}
-		if maxVis < 1 {
-			maxVis = 1
-		}
-
-		filtered := filterBlocks(blocks, query)
+		filtered := filterBlocks(blocks, query, searchOutput)
 		total := len(blocks)
 		shown := len(filtered)
 
@@ -612,11 +674,36 @@ func runInteractive() {
 			sel = shown - 1
 		}
 
-		if sel < offset {
-			offset = sel
+		availLines := 16
+		if h < 20 {
+			availLines = h - 4
 		}
-		if sel >= offset+maxVis {
-			offset = sel - maxVis + 1
+		if availLines < 1 {
+			availLines = 1
+		}
+
+		// Adjust offset to ensure sel is within the visible area
+		for {
+			if sel < offset {
+				offset = sel
+			}
+			visCount := 0
+			linesUsed := 0
+			for i := offset; i < shown; i++ {
+				needed := 1
+				if filtered[i].MatchedLine != "" {
+					needed = 2
+				}
+				if linesUsed+needed > availLines && visCount > 0 {
+					break
+				}
+				linesUsed += needed
+				visCount++
+			}
+			if shown == 0 || sel < offset+visCount {
+				break
+			}
+			offset++
 		}
 
 		// Move up to the start of our UI
@@ -642,34 +729,36 @@ func runInteractive() {
 		fmt.Printf("%s  %s%s%s\r\n", escClearLine, cDim, strings.Repeat("─", w-4), cReset)
 		linesThisFrame++
 
-		// Results: render only actual items (no empty rows)
-		visCount := shown - offset
-		if visCount > maxVis {
-			visCount = maxVis
-		}
-		if visCount < 0 {
-			visCount = 0
+		// Results: render only actual items
+		visCount := 0
+		linesUsed := 0
+		for i := offset; i < shown; i++ {
+			needed := 1
+			if filtered[i].MatchedLine != "" {
+				needed = 2
+			}
+			if linesUsed+needed > availLines && visCount > 0 {
+				break
+			}
+			linesUsed += needed
+			visCount++
 		}
 
 		for i := 0; i < visCount; i++ {
 			idx := offset + i
-			fmt.Print(escClearLine)
 			b := filtered[idx]
 			fName := filepath.Base(b.File)
 			fName = strings.TrimSuffix(fName, ".log")
 			meta := fmt.Sprintf("%s · L%d", fName, b.LineNum)
 			metaW := len([]rune(meta))
 
-			cmdW := w - 6 - metaW - 2
+			cmdW := w - 4 - 2 - metaW // 4 for "  ▸ ", 2 for gap before meta
 			if cmdW < 10 {
 				cmdW = 10
 			}
 
 			coloredCmd := truncANSI(b.RawCommand, cmdW)
-			cmdVis := visibleLen(b.RawCommand)
-			if cmdVis > cmdW {
-				cmdVis = cmdW + 1
-			}
+			cmdVis := visibleLen(coloredCmd)
 			cmdPad := cmdW - cmdVis
 			if cmdPad < 0 {
 				cmdPad = 0
@@ -681,20 +770,47 @@ func runInteractive() {
 				if selPad < 0 {
 					selPad = 0
 				}
-				content := fmt.Sprintf("  %s▸ %s%s  %s",
-					cFgSel, selCmd, strings.Repeat(" ", selPad), meta)
-				visW := 4 + cmdW + 2 + metaW
-				trailPad := w - visW
-				if trailPad < 0 {
-					trailPad = 0
+				
+				// Line 1: Command
+				content1 := fmt.Sprintf("  %s▸ %s%s  %s", cFgSel, selCmd, strings.Repeat(" ", selPad), meta)
+				visW1 := 4 + len([]rune(selCmd)) + selPad + 2 + len([]rune(meta))
+				trailPad1 := w - visW1
+				if trailPad1 < 0 { trailPad1 = 0 }
+				fmt.Printf("%s%s%s%s%s%s\r\n", escClearLine, cBgSel, cFgSel, content1, strings.Repeat(" ", trailPad1), cReset)
+				linesThisFrame++
+
+				// Line 2: MatchedLine
+				if b.MatchedLine != "" {
+					matchW := w - 6
+					if matchW < 10 { matchW = 10 }
+					truncMatch := truncStr("↳ "+b.MatchedLine, matchW)
+					matchPad := matchW - len([]rune(truncMatch))
+					if matchPad < 0 { matchPad = 0 }
+					
+					content2 := fmt.Sprintf("      %s%s", truncMatch, strings.Repeat(" ", matchPad))
+					visW2 := 6 + len([]rune(truncMatch)) + matchPad
+					trailPad2 := w - visW2
+					if trailPad2 < 0 { trailPad2 = 0 }
+					
+					fmt.Printf("%s%s%s%s%s%s\r\n", escClearLine, cBgSel, cFgSel, content2, strings.Repeat(" ", trailPad2), cReset)
+					linesThisFrame++
 				}
-				fmt.Printf("%s%s%s%s%s%s\r\n", escClearLine, cBgSel, cFgSel, content, strings.Repeat(" ", trailPad), cReset)
 			} else {
+				// Line 1: Command
 				fmt.Printf("%s    %s%s  %s%s%s\r\n", escClearLine,
 					coloredCmd, strings.Repeat(" ", cmdPad),
 					cDim, meta, cReset)
+				linesThisFrame++
+
+				// Line 2: MatchedLine
+				if b.MatchedLine != "" {
+					matchW := w - 6
+					if matchW < 10 { matchW = 10 }
+					truncMatch := truncStr("↳ "+b.MatchedLine, matchW)
+					fmt.Printf("%s      %s%s%s\r\n", escClearLine, cDim, truncMatch, cReset)
+					linesThisFrame++
+				}
 			}
-			linesThisFrame++
 		}
 
 		// Status bar: immediately after last result

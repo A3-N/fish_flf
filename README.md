@@ -12,6 +12,7 @@ A native-feeling, fuzzy-searching TUI shell plugin for Fish and Kitty terminal. 
 To automatically check dependencies, configure Kitty, build the Go binary, and install the Fish shell hooks, simply run:
 
 ```bash
+# make check
 make install
 ```
 
@@ -20,12 +21,14 @@ Once installed, restart your Fish shell or run the provided source command, and 
 ## Usage
 
 **Interactive Mode:**
-Press `ctrl+g` in your Fish shell to open the interactive dropdown. Type to fuzzy search your command history, use `↑/↓` to navigate, and press `Enter` to output the selected command block.
+- **`ctrl+g`**: Open the interactive dropdown to search your **command** history. Type to fuzzy search, use `↑/↓` to navigate, and press `Enter` to output the selected command block.
+- **`ctrl+o`**: Deep search mode. Searches through both your commands **and** the terminal output they generated, displaying the matched text directly below the command.
 
 **CLI Mode:**
 You can also use the `flf` binary directly to run standard text searches against your logs:
 ```bash
 flf <search_query>
+flf --output <search_query>  # Also search the output bodies
 ```
 
 ## Management
